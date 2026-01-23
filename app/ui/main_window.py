@@ -110,7 +110,7 @@ class MainWindow(QMainWindow):
         self.selection_row_to_restore: Optional[int] = None
         self.busy = False
 
-        self.setWindowTitle("McWurzn")
+        self.setWindowTitle("McWurzn-Manager")
         self.resize(980, 620)
 
         self._build_ui()
