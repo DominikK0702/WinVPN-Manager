@@ -15,7 +15,6 @@ class VpnProfile:
 class VpnProfileSpec:
     name: str
     server_address: str
-    tunnel_type: str
 
 
 @dataclass

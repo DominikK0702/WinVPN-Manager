@@ -23,15 +23,19 @@ def get_logger() -> logging.Logger:
     logger.propagate = False
 
     if not logger.handlers:
-        handler = RotatingFileHandler(
-            _log_path(),
-            maxBytes=1_000_000,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        # Do not create local log files for frozen/packaged builds.
+        if getattr(sys, "frozen", False):
+            logger.addHandler(logging.NullHandler())
+        else:
+            handler = RotatingFileHandler(
+                _log_path(),
+                maxBytes=1_000_000,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
 
     _LOGGER = logger
     return logger

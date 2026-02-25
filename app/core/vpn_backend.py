@@ -1,12 +1,11 @@
 from abc import ABC, abstractmethod
-from typing import List
 
 from core.models import OperationResult, VpnProfile, VpnProfileSpec
 
 
 class VpnBackend(ABC):
     @abstractmethod
-    def list_profiles(self, include_all_users: bool = False) -> List[VpnProfile]:
+    def list_profiles(self, include_all_users: bool = False) -> list[VpnProfile]:
         raise NotImplementedError
 
     @abstractmethod
@@ -46,4 +45,14 @@ class VpnBackend(ABC):
 
     @abstractmethod
     def delete_profile(self, name: str, all_users: bool = False) -> OperationResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    def open_native_credential_prompt(
+        self,
+        name: str,
+        all_users: bool = False,
+        wait: bool = False,
+        timeout: int = 120,
+    ) -> OperationResult:
         raise NotImplementedError

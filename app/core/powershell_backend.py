@@ -3,7 +3,7 @@ import json
 import os
 import subprocess
 import time
-from typing import List, Optional
+from typing import Optional
 
 from core.logger import get_logger
 from core.models import OperationResult, VpnProfile, VpnProfileSpec
@@ -15,10 +15,9 @@ class PowerShellRasBackend(VpnBackend):
         self.logger = get_logger()
         self.last_error = ""
 
-    def list_profiles(self, include_all_users: bool = False) -> List[VpnProfile]:
+    def list_profiles(self, include_all_users: bool = False) -> list[VpnProfile]:
         self.last_error = ""
         profiles = self._list_user_profiles()
-
         if include_all_users:
             if not self._is_admin():
                 self.last_error = (
@@ -26,20 +25,16 @@ class PowerShellRasBackend(VpnBackend):
                     "Run the app as Administrator."
                 )
                 return profiles
-
             try:
-                all_user_profiles = self._list_all_user_profiles()
+                profiles.extend(self._list_all_user_profiles())
             except RuntimeError as exc:
-                self.logger.warning("All-user query failed: %s", exc)
                 self.last_error = f"All-user query failed: {exc}"
-            else:
-                profiles.extend(all_user_profiles)
-
+                self.logger.warning(self.last_error)
         return profiles
 
     def get_status(self, name: str, all_users: bool = False) -> str:
+        all_users_flag = " -AllUserConnection" if all_users else ""
         try:
-            all_users_flag = " -AllUserConnection" if all_users else ""
             data = self._run_powershell_json(
                 f"Get-VpnConnection -Name {self._ps_quote(name)}{all_users_flag} "
                 "| Select-Object ConnectionStatus"
@@ -50,16 +45,12 @@ class PowerShellRasBackend(VpnBackend):
 
         if not data:
             return "Unknown"
-        status = data[0].get("ConnectionStatus") or "Unknown"
-        return str(status)
+        return str(data[0].get("ConnectionStatus") or "Unknown")
 
     def connect(self, name: str, all_users: bool = False, timeout: int = 20) -> OperationResult:
-        # rasdial.exe is the built-in Windows CLI for VPN connect/disconnect.
-        # We call "rasdial <ProfileName>" to connect using the saved credentials.
         return self._run_rasdial(self._rasdial_args(name, all_users), timeout=timeout)
 
     def disconnect(self, name: str, all_users: bool = False, timeout: int = 20) -> OperationResult:
-        # rasdial.exe supports "/disconnect" to terminate a VPN connection.
         result = self._run_rasdial(
             self._rasdial_args(name, all_users, disconnect=True),
             timeout=timeout,
@@ -75,7 +66,7 @@ class PowerShellRasBackend(VpnBackend):
         poll_interval: float = 1.0,
         max_wait: int = 20,
     ) -> OperationResult:
-        result = self.connect(name, all_users)
+        result = self._connect_with_credential_recovery(name, all_users)
         if not result.success:
             result.status = "Error"
             return result
@@ -88,18 +79,19 @@ class PowerShellRasBackend(VpnBackend):
             last_status = self.get_status(name, all_users)
             if last_status.lower() == "connected":
                 return OperationResult(
-                    success=True,
-                    message=f"Connected to {name}.",
+                    True,
+                    f"Connected to {name}.",
                     status=last_status,
                 )
             if last_status.lower() == "error":
                 break
 
-        message = f"Timed out waiting for {name} to connect."
-        message = self._add_credential_hint(message, result.details)
+        message = self._add_credential_hint(f"Timed out waiting for {name} to connect.", result.details)
+        if self._is_credential_issue(message, result.details):
+            message = f"{message} Please save credentials in the Windows prompt."
         return OperationResult(
-            success=False,
-            message=message,
+            False,
+            message,
             status=last_status if last_status else "Error",
             details=result.details,
         )
@@ -113,14 +105,12 @@ class PowerShellRasBackend(VpnBackend):
             "Add-VpnConnection "
             f"-Name {self._ps_quote(spec.name)} "
             f"-ServerAddress {self._ps_quote(spec.server_address)} "
-            f"-TunnelType {self._ps_quote(spec.tunnel_type)}"
+            "-TunnelType 'Automatic' "
+            "-RememberCredential"
         )
         if all_users:
             command += " -AllUserConnection"
-        return self._run_powershell(
-            command,
-            success_message=f"Created VPN profile {spec.name}.",
-        )
+        return self._run_powershell(command, success_message=f"Created VPN profile {spec.name}.")
 
     def update_profile(
         self,
@@ -136,15 +126,13 @@ class PowerShellRasBackend(VpnBackend):
             "Set-VpnConnection "
             f"-Name {self._ps_quote(name)} "
             f"-ServerAddress {self._ps_quote(spec.server_address)} "
-            f"-TunnelType {self._ps_quote(spec.tunnel_type)} "
+            "-TunnelType 'Automatic' "
+            "-RememberCredential "
             "-Force"
         )
         if all_users:
             command += " -AllUserConnection"
-        return self._run_powershell(
-            command,
-            success_message=f"Updated VPN profile {name}.",
-        )
+        return self._run_powershell(command, success_message=f"Updated VPN profile {name}.")
 
     def delete_profile(self, name: str, all_users: bool = False) -> OperationResult:
         admin_error = self._ensure_admin(all_users)
@@ -154,34 +142,91 @@ class PowerShellRasBackend(VpnBackend):
         command = f"Remove-VpnConnection -Name {self._ps_quote(name)} -Force"
         if all_users:
             command += " -AllUserConnection"
-        return self._run_powershell(
-            command,
-            success_message=f"Deleted VPN profile {name}.",
-        )
+        return self._run_powershell(command, success_message=f"Deleted VPN profile {name}.")
 
-    def _list_user_profiles(self) -> List[VpnProfile]:
-        # PowerShell: Get-VpnConnection returns VPN objects; ConvertTo-Json makes parsing reliable.
+    def open_native_credential_prompt(
+        self,
+        name: str,
+        all_users: bool = False,
+        wait: bool = False,
+        timeout: int = 120,
+    ) -> OperationResult:
+        args = ["rasphone.exe"]
+        phonebook = self._rasphonebook_path(all_users)
+        if phonebook:
+            args.extend(["-f", phonebook])
+        args.extend(["-d", name])
+
+        try:
+            if wait:
+                subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=timeout,
+                )
+            else:
+                subprocess.Popen(args)
+        except subprocess.TimeoutExpired:
+            return OperationResult(
+                False,
+                f"Windows credential prompt timed out after {timeout} seconds.",
+                status="Error",
+            )
+        except Exception as exc:
+            return OperationResult(
+                False,
+                f"Could not open Windows credential prompt: {exc}",
+                status="Error",
+            )
+        return OperationResult(True, f"Opened Windows credential prompt for {name}.")
+
+    def _connect_with_credential_recovery(self, name: str, all_users: bool = False) -> OperationResult:
+        first = self.connect(name, all_users)
+        if first.success:
+            return first
+        if not self._is_credential_issue(first.message, first.details):
+            return first
+
+        prompt = self.open_native_credential_prompt(name, all_users, wait=True, timeout=120)
+        if not prompt.success:
+            first.message = (
+                f"{first.message} Could not complete credential recovery: {prompt.message}"
+            ).strip()
+            return first
+
+        retry = self.connect(name, all_users)
+        if retry.success:
+            retry.message = f"{prompt.message} Retried connection successfully."
+            return retry
+        retry.message = (
+            f"{retry.message} Credential prompt was shown and reconnect was retried once."
+        ).strip()
+        return retry
+
+    def _list_user_profiles(self) -> list[VpnProfile]:
         data = self._run_powershell_json(
             "Get-VpnConnection "
             "| Select-Object Name,ServerAddress,TunnelType,AuthenticationMethod,ConnectionStatus"
         )
         return self._to_profiles(data, all_users=False)
 
-    def _list_all_user_profiles(self) -> List[VpnProfile]:
+    def _list_all_user_profiles(self) -> list[VpnProfile]:
         data = self._run_powershell_json(
             "Get-VpnConnection -AllUserConnection "
             "| Select-Object Name,ServerAddress,TunnelType,AuthenticationMethod,ConnectionStatus"
         )
         return self._to_profiles(data, all_users=True)
 
-    def _to_profiles(self, data: List[dict], all_users: bool) -> List[VpnProfile]:
-        profiles = []
+    def _to_profiles(self, data: list[dict], all_users: bool) -> list[VpnProfile]:
+        profiles: list[VpnProfile] = []
         for entry in data:
             profiles.append(
                 VpnProfile(
                     name=str(entry.get("Name", "")),
                     server_address=self._stringify(entry.get("ServerAddress")),
-                    tunnel_type=self._stringify(entry.get("TunnelType")),
+                    tunnel_type=self._stringify(entry.get("TunnelType")) or "Automatic",
                     authentication_method=self._stringify(entry.get("AuthenticationMethod")),
                     connection_status=self._stringify(entry.get("ConnectionStatus") or "Unknown"),
                     all_users=all_users,
@@ -189,7 +234,7 @@ class PowerShellRasBackend(VpnBackend):
             )
         return profiles
 
-    def _run_powershell_json(self, command: str, timeout: int = 10) -> List[dict]:
+    def _run_powershell_json(self, command: str, timeout: int = 15) -> list[dict]:
         full_command = f"$ErrorActionPreference='Stop'; {command} | ConvertTo-Json -Depth 4"
         process = subprocess.run(
             [
@@ -203,14 +248,15 @@ class PowerShellRasBackend(VpnBackend):
             ],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
+            **self._subprocess_hidden_window_kwargs(),
         )
 
-        stdout = process.stdout.strip()
-        stderr = process.stderr.strip()
+        stdout = (process.stdout or "").strip()
+        stderr = (process.stderr or "").strip()
         if process.returncode != 0:
             raise RuntimeError(stderr or stdout or "PowerShell command failed.")
-
         if not stdout:
             return []
 
@@ -228,7 +274,7 @@ class PowerShellRasBackend(VpnBackend):
     def _run_powershell(
         self,
         command: str,
-        timeout: int = 20,
+        timeout: int = 25,
         success_message: str = "PowerShell command completed.",
     ) -> OperationResult:
         full_command = f"$ErrorActionPreference='Stop'; {command}"
@@ -244,48 +290,45 @@ class PowerShellRasBackend(VpnBackend):
             ],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
+            **self._subprocess_hidden_window_kwargs(),
         )
 
-        stdout = process.stdout.strip()
-        stderr = process.stderr.strip()
+        stdout = (process.stdout or "").strip()
+        stderr = (process.stderr or "").strip()
         details = "\n".join(part for part in [stdout, stderr] if part)
-
         if process.returncode != 0:
             message = stderr or stdout or "PowerShell command failed."
             return OperationResult(False, message, status="Error", details=details)
-
         return OperationResult(True, success_message, details=details)
 
-    def _run_rasdial(self, args: List[str], timeout: int = 20) -> OperationResult:
+    def _run_rasdial(self, args: list[str], timeout: int = 20) -> OperationResult:
         try:
             process = subprocess.run(
                 ["rasdial.exe", *args],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=timeout,
+                **self._subprocess_hidden_window_kwargs(),
             )
         except subprocess.TimeoutExpired:
             message = self._add_credential_hint(
                 "rasdial timed out while waiting for credentials.",
                 "",
             )
-            self.logger.error(message)
             return OperationResult(False, message, status="Error")
 
-        stdout = process.stdout.strip()
-        stderr = process.stderr.strip()
+        stdout = (process.stdout or "").strip()
+        stderr = (process.stderr or "").strip()
         details = "\n".join(part for part in [stdout, stderr] if part)
-
         if process.returncode != 0:
-            message = stderr or stdout or "rasdial returned an error."
-            message = self._add_credential_hint(message, details)
-            self.logger.error("rasdial error: %s", message)
+            message = self._add_credential_hint(stderr or stdout or "rasdial returned an error.", details)
             return OperationResult(False, message, status="Error", details=details)
-
         return OperationResult(True, stdout or "rasdial completed.", status="Connected", details=details)
 
-    def _rasdial_args(self, name: str, all_users: bool, disconnect: bool = False) -> List[str]:
+    def _rasdial_args(self, name: str, all_users: bool, disconnect: bool = False) -> list[str]:
         args = [name]
         phonebook = self._rasphonebook_path(all_users)
         if phonebook:
@@ -322,15 +365,25 @@ class PowerShellRasBackend(VpnBackend):
     def _add_credential_hint(self, message: str, details: str) -> str:
         hint = "Please connect once via Windows VPN settings and save credentials."
         text = f"{message}".strip()
+        if self._is_credential_issue(message, details):
+            return f"{text} {hint}"
+        return text
+
+    def _is_credential_issue(self, message: str, details: str) -> bool:
         combined = f"{message}\n{details}".lower()
-        if (
-            "credential" in combined
+        return (
+            "ras-fehler 691" in combined
+            or "error 691" in combined
+            or " 691" in combined
+            or "benutzername" in combined
+            or "kennwort" in combined
+            or "authentifizierungsprotokoll" in combined
+            or "verweigert" in combined
+            or "credential" in combined
             or "password" in combined
             or "username" in combined
             or "timed out" in combined
-        ):
-            return f"{text} {hint}"
-        return text
+        )
 
     def _is_admin(self) -> bool:
         try:
@@ -338,13 +391,21 @@ class PowerShellRasBackend(VpnBackend):
         except Exception:
             return False
 
+    def _subprocess_hidden_window_kwargs(self) -> dict:
+        kwargs: dict = {}
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return kwargs
+
     def _ensure_admin(self, all_users: bool) -> Optional[OperationResult]:
-        if not all_users:
+        if not all_users or self._is_admin():
             return None
-        if self._is_admin():
-            return None
-        message = (
+        return OperationResult(
+            False,
             "Admin privileges are required to manage system-wide VPN profiles. "
-            "Run the app as Administrator."
+            "Run the app as Administrator.",
+            status="Error",
         )
-        return OperationResult(False, message, status="Error")
