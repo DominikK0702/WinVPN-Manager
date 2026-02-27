@@ -16,15 +16,12 @@ Windows desktop app (PySide6) to manage native Windows VPN connections.
 ## Download
 Use the latest prebuilt artifact from **GitHub Releases**.
 
-- Download the portable folder release asset
-- Extract it anywhere
-- Run `WinVPN-Manager.exe` from the extracted folder
-
-Expected runtime path:
-- `dist\WinVPN-Manager\WinVPN-Manager.exe`
+- Download `WinVPN-Manager-Setup-<version>.exe`
+- Run the installer
+- Start the app from Start Menu or Desktop shortcut
 
 ## Quick Start (End Users)
-1. Start `WinVPN-Manager.exe`.
+1. Start `WinVPN-Manager`.
 2. Click `New...` and create a VPN profile.
 3. Use `Set Credentials (Windows)` (or the auto prompt) to save credentials in Windows.
 4. Connect, disconnect, and manage profiles from the table.
@@ -42,6 +39,7 @@ Notes:
 ### Prerequisites
 - Python 3.14 (current project environment target)
 - PowerShell
+- Inno Setup 6 (`ISCC.exe`) for installer builds
 
 ### Run from source
 ```powershell
@@ -63,6 +61,15 @@ Build notes:
 - `build.ps1` installs build dependencies from `requirements-build.txt`
 - `build.ps1` auto-generates `app\logo.ico` from `app\logo.png` for EXE icon embedding
 
+### Build installer (recommended for shipping)
+```powershell
+.\build-installer.ps1
+```
+
+Installer output:
+- `installer-output\WinVPN-Manager-Setup-<version>.exe`
+- `installer-output\WinVPN-Manager-Setup-<version>.exe.sha256`
+
 ## Troubleshooting
 ### Black console windows appear
 - Use a current build from this repo; subprocesses are configured to run hidden.
@@ -76,6 +83,10 @@ Build notes:
 ### EXE blocked by SmartScreen/AV
 - This can happen with unsigned binaries. Use trusted release sources and local policy exceptions if required.
 
+### `failed to load python dll, _internal\python314.dll`
+- This indicates an incomplete portable copy. Use the installer build for end users.
+- If using portable output internally, copy the entire `dist\WinVPN-Manager` folder, not only `WinVPN-Manager.exe`.
+
 ## Project Layout
 ```text
 app/
@@ -84,6 +95,9 @@ app/
   core/
   ui/
 build.ps1
+build-installer.ps1
+installer/
+  winvpn-manager.iss
 winvpn_manager.spec
 requirements.txt
 requirements-build.txt

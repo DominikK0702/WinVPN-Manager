@@ -3,4 +3,5 @@ __pycache__/
 .idea/
 build/
 dist/
+installer-output/
 *.spec.bak
